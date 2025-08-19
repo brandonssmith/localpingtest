@@ -25,16 +25,15 @@ class PingTest:
     def load_config(self) -> Dict:
         """Load configuration from JSON file"""
         default_config = {
-            "ip_addresses": [
-                "8.8.8.8",      # Google DNS
-                "1.1.1.1",      # Cloudflare DNS
-                "208.67.222.222" # OpenDNS
-            ],
+            "ip_addresses": {
+                "8.8.8.8": "Google DNS",
+                "1.1.1.1": "Cloudflare DNS",
+                "208.67.222.222": "OpenDNS"
+            },
             "ping_interval": 60,  # seconds
             "ping_count": 4,      # number of pings per check
             "timeout": 5,         # timeout in seconds
             "log_file": "pingtest.log",
-            "max_ips": 10,
             "total_runtime": 0    # total runtime in seconds (0 = run indefinitely)
         }
         
@@ -42,6 +41,15 @@ class PingTest:
             if os.path.exists(self.config_file):
                 with open(self.config_file, 'r') as f:
                     config = json.load(f)
+                    
+                    # Handle legacy config format (convert list of IPs to dict format)
+                    if "ip_addresses" in config and isinstance(config["ip_addresses"], list):
+                        # Convert old format to new format
+                        old_ips = config["ip_addresses"]
+                        config["ip_addresses"] = {}
+                        for ip in old_ips:
+                            config["ip_addresses"][ip] = ""
+                    
                     # Merge with defaults for any missing keys
                     for key, value in default_config.items():
                         if key not in config:
@@ -58,16 +66,33 @@ class PingTest:
     
     def setup_logging(self):
         """Setup logging configuration"""
+        # Generate timestamped log filename
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_log_file = self.config['log_file']
+        
+        # Split filename and extension
+        if '.' in base_log_file:
+            name_part, ext_part = base_log_file.rsplit('.', 1)
+            timestamped_log_file = f"{name_part}_{timestamp}.{ext_part}"
+        else:
+            timestamped_log_file = f"{base_log_file}_{timestamp}"
+        
+        # Update config with timestamped filename
+        self.config['log_file'] = timestamped_log_file
+        
         log_format = '%(asctime)s - %(levelname)s - %(message)s'
         logging.basicConfig(
             level=logging.INFO,
             format=log_format,
             handlers=[
-                logging.FileHandler(self.config['log_file']),
+                logging.FileHandler(timestamped_log_file),
                 logging.StreamHandler(sys.stdout)
             ]
         )
         self.logger = logging.getLogger(__name__)
+        
+        # Log the start of the session
+        self.logger.info(f"PingTest session started - Log file: {timestamped_log_file}")
     
     def ping_host(self, ip_address: str) -> Dict:
         """Ping a single host and return results"""
@@ -98,19 +123,35 @@ class PingTest:
             if process.returncode == 0:
                 # Parse ping output
                 output = process.stdout
-                result['success'] = True
                 
-                # Extract response time (average)
+                # Extract response time (average) - this is required for success
+                response_time_extracted = False
                 if platform.system().lower() == "windows":
                     # Windows ping output parsing
                     lines = output.split('\n')
                     for line in lines:
                         if 'Average =' in line:
                             try:
-                                avg_time = line.split('Average =')[1].split('ms')[0].strip()
-                                result['response_time'] = float(avg_time)
-                            except:
-                                pass
+                                # Handle different Windows ping output formats
+                                if 'Average =' in line:
+                                    avg_time = line.split('Average =')[1].split('ms')[0].strip()
+                                    result['response_time'] = float(avg_time)
+                                    response_time_extracted = True
+                                elif 'Average=' in line:  # No space after equals
+                                    avg_time = line.split('Average=')[1].split('ms')[0].strip()
+                                    result['response_time'] = float(avg_time)
+                                    response_time_extracted = True
+                            except (ValueError, IndexError):
+                                # Try alternative parsing if the first method fails
+                                try:
+                                    # Look for time pattern like "Average = 5.00ms"
+                                    import re
+                                    time_match = re.search(r'Average\s*=\s*(\d+\.?\d*)ms', line)
+                                    if time_match:
+                                        result['response_time'] = float(time_match.group(1))
+                                        response_time_extracted = True
+                                except:
+                                    pass
                         elif 'Lost =' in line:
                             try:
                                 lost_info = line.split('Lost =')[1].split('(')[0].strip()
@@ -127,10 +168,27 @@ class PingTest:
                     for line in lines:
                         if 'rtt min/avg/max' in line:
                             try:
-                                avg_time = line.split('avg/')[1].split('/')[0]
-                                result['response_time'] = float(avg_time)
-                            except:
-                                pass
+                                # Handle different Linux/Mac ping output formats
+                                if 'rtt min/avg/max' in line:
+                                    avg_time = line.split('avg/')[1].split('/')[0]
+                                    result['response_time'] = float(avg_time)
+                                    response_time_extracted = True
+                                elif 'round-trip' in line:  # Alternative format
+                                    import re
+                                    time_match = re.search(r'avg\s*=\s*(\d+\.?\d*)', line)
+                                    if time_match:
+                                        result['response_time'] = float(time_match.group(1))
+                                        response_time_extracted = True
+                            except (ValueError, IndexError):
+                                # Try alternative parsing if the first method fails
+                                try:
+                                    import re
+                                    time_match = re.search(r'avg\s*=\s*(\d+\.?\d*)', line)
+                                    if time_match:
+                                        result['response_time'] = float(time_match.group(1))
+                                        response_time_extracted = True
+                                except:
+                                    pass
                         elif 'packets transmitted' in line:
                             try:
                                 parts = line.split(',')
@@ -140,6 +198,13 @@ class PingTest:
                                     result['packet_loss'] = ((transmitted - received) / transmitted) * 100
                             except:
                                 pass
+                
+                # Only mark as successful if we actually got a response time
+                if response_time_extracted:
+                    result['success'] = True
+                else:
+                    result['error'] = "Failed to parse response time from ping output"
+                    result['success'] = False
             else:
                 result['error'] = f"Ping failed with return code: {process.returncode}"
                 if process.stderr:
@@ -154,26 +219,24 @@ class PingTest:
     
     def log_ping_result(self, result: Dict):
         """Log ping result to file and console"""
+        # Get IP name if available
+        ip_name = self.config['ip_addresses'].get(result['ip'], "")
+        display_text = f"{ip_name} ({result['ip']})" if ip_name else result['ip']
+        
         if result['success']:
-            if result['response_time'] is not None:
-                self.logger.info(
-                    f"Ping to {result['ip']}: SUCCESS - "
-                    f"Response time: {result['response_time']:.2f}ms, "
-                    f"Packet loss: {result['packet_loss']:.1f}%"
-                )
-            else:
-                self.logger.info(
-                    f"Ping to {result['ip']}: SUCCESS - "
-                    f"Packet loss: {result['packet_loss']:.1f}%"
-                )
+            self.logger.info(
+                f"Ping to {display_text}: SUCCESS - "
+                f"Response time: {result['response_time']:.2f}ms, "
+                f"Packet loss: {result['packet_loss']:.1f}%"
+            )
         else:
             self.logger.error(
-                f"Ping to {result['ip']}: FAILED - {result['error']}"
+                f"Ping to {display_text}: FAILED - {result['error']}"
             )
     
     def run_ping_test(self):
         """Run ping test for all configured IP addresses"""
-        ip_addresses = self.config['ip_addresses'][:self.config['max_ips']]
+        ip_addresses = self.config['ip_addresses']
         
         if not ip_addresses:
             self.logger.error("No IP addresses configured")
@@ -208,7 +271,11 @@ class PingTest:
                 self.logger.info("-" * 50)
                 self.logger.info(f"Ping test started at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                 
-                for ip in ip_addresses:
+                for ip, display_name in ip_addresses.items():
+                    if display_name:
+                        self.logger.info(f"Pinging {display_name} ({ip})...")
+                    else:
+                        self.logger.info(f"Pinging {ip}...")
                     result = self.ping_host(ip)
                     self.log_ping_result(result)
                     time.sleep(1)  # Small delay between pings
@@ -234,7 +301,7 @@ class PingTest:
     
     def run_single_test(self):
         """Run a single ping test and exit"""
-        ip_addresses = self.config['ip_addresses'][:self.config['max_ips']]
+        ip_addresses = self.config['ip_addresses']
         
         if not ip_addresses:
             self.logger.error("No IP addresses configured")
@@ -242,7 +309,11 @@ class PingTest:
         
         self.logger.info(f"Running single ping test for {len(ip_addresses)} IP addresses")
         
-        for ip in ip_addresses:
+        for ip, display_name in ip_addresses.items():
+            if display_name:
+                self.logger.info(f"Pinging {display_name} ({ip})...")
+            else:
+                self.logger.info(f"Pinging {ip}...")
             result = self.ping_host(ip)
             self.log_ping_result(result)
             time.sleep(1)
